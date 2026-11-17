@@ -7,13 +7,27 @@ on:
         description: 'YouTube Video / Stream URL'
         required: true
         type: string
+      num_reels:
+        description: 'How many reels to produce'
+        required: false
+        default: '3'
+        type: string
+      whisper_model:
+        description: 'faster-whisper model (tiny/base/small/medium)'
+        required: false
+        default: 'small'
+        type: string
 
 jobs:
   produce-reels:
     runs-on: ubuntu-latest
     env:
       VIDEO_URL: ${{ github.event.inputs.youtube_url }}
+      NUM_REELS: ${{ github.event.inputs.num_reels }}
+      WHISPER_MODEL: ${{ github.event.inputs.whisper_model }}
+      TIGHTEN_SILENCE: '1'
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       YT_COOKIES: ${{ secrets.YT_COOKIES }}
@@ -36,29 +50,25 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 fonts-liberation
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 libegl1 libgles2 fonts-liberation
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install --upgrade --pre "yt-dlp[default]"
 
-      - name: Step 1 - Multimodal Vision + Audio Analysis
+      - name: Step 1 - Prep + Gemini Eyes & Ears
         run: python scripts/1_multimodal_director.py
 
-      - name: Step 2 - Adaptive Reframe, Zoom Physics & Captions
-        run: python scripts/2_adaptive_editor.py
+      - name: Step 2 - ERNIE Showrunner + Critic
+        run: python scripts/2_showrunner.py
 
-      - name: Step 3 - Deliver Masters to Telegram
-        run: |
-          for reel in final_reels/*.mp4; do
-            [ -e "$reel" ] || continue
-            FILENAME=$(basename "$reel")
-            curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
-                 -F video=@"$reel" \
-                 -F caption="🎬 $FILENAME" \
-                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendVideo" > /dev/null
-          done
+      - name: Step 3 - Adaptive Edit, Motion Graphics & Sound Design
+        run: python scripts/3_adaptive_editor.py
+
+      - name: Step 4 - Deliver Masters to Telegram (size-guarded)
+        run: python scripts/4_deliver.py
 
       - name: Archive High-Bitrate Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: studio-reels-masters
