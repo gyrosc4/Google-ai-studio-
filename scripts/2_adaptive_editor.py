@@ -1,134 +1,143 @@
 import os
 import json
+import math
+import urllib.request
 import subprocess
 import cv2
 import numpy as np
 import mediapipe as mp
-import pysubs2
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
-def build_dynamic_captions(words, clip_start, clip_end, theme, hook_title, ass_path):
-    subs = pysubs2.SSAFile()
-    subs.info["PlayResX"] = 1080
-    subs.info["PlayResY"] = 1920
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+MODEL_PATH = "work/blaze_face_short_range.tflite"
 
-    # Theme configurations (Colors in BGR format for ASS)
-    themes = {
-        "hype_gaming": {
-            "primary": pysubs2.Color(255, 255, 255, 0),
-            "highlight": r"\c&H00FF00&",   # Neon Green
-            "fontsize": 86,
-            "marginv": 340,
-            "chunk_size": 2
-        },
-        "editorial_podcast": {
-            "primary": pysubs2.Color(255, 255, 255, 0),
-            "highlight": r"\c&H00D7FF&",   # Warm Gold/Yellow
-            "fontsize": 76,
-            "marginv": 380,
-            "chunk_size": 3
-        },
-        "bold_explainer": {
-            "primary": pysubs2.Color(255, 255, 255, 0),
-            "highlight": r"\c&HFF9900&",   # Electric Cyan/Blue
-            "fontsize": 80,
-            "marginv": 360,
-            "chunk_size": 3
-        }
-    }
-    cfg = themes.get(theme, themes["editorial_podcast"])
+def ensure_face_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading MediaPipe BlazeFace task model...", flush=True)
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
-    # Main Caption Style
-    cap_style = pysubs2.SSAStyle()
-    cap_style.fontname = "Montserrat ExtraBold"
-    cap_style.fontsize = cfg["fontsize"]
-    cap_style.primarycolor = cfg["primary"]
-    cap_style.outlinecolor = pysubs2.Color(0, 0, 0, 0)
-    cap_style.backcolor = pysubs2.Color(0, 0, 0, 140)
-    cap_style.bold = True
-    cap_style.outline = 7
-    cap_style.shadow = 4
-    cap_style.alignment = 2
-    cap_style.marginv = cfg["marginv"]
-    subs.styles["Default"] = cap_style
+def format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs == 100:
+        s += 1
+        cs = 0
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-    # Top Hook Banner Style (visible for first 4.5 seconds)
-    hook_style = pysubs2.SSAStyle()
-    hook_style.fontname = "Montserrat ExtraBold"
-    hook_style.fontsize = 58
-    hook_style.primarycolor = pysubs2.Color(0, 0, 0, 0)         # Black text
-    hook_style.outlinecolor = pysubs2.Color(255, 255, 255, 0)   # White pill box border
-    hook_style.backcolor = pysubs2.Color(255, 255, 255, 0)
-    hook_style.borderstyle = 3                                  # Opaque box background
-    hook_style.outline = 18
-    hook_style.bold = True
-    hook_style.alignment = 8                                    # Top-center
-    hook_style.marginv = 210
-    subs.styles["HookBanner"] = hook_style
-
-    # Add Hook Title Banner for the opening 4.5 seconds
-    duration_ms = int((clip_end - clip_start) * 1000)
-    subs.events.append(pysubs2.SSAEvent(
-        start=0,
-        end=min(4500, duration_ms),
-        style="HookBanner",
-        text=hook_title.upper()
-    ))
-
+def generate_ass_subtitles(words: list, clip_start: float, clip_end: float, title: str, theme: str, ass_path: str):
     clip_words = [
         {
             "word": w["word"].upper(),
             "start": max(0.0, w["start"] - clip_start),
-            "end": min(clip_end - clip_start, w["end"] - clip_start)
+            "end": max(0.05, w["end"] - clip_start),
         }
         for w in words
-        if w["end"] > clip_start and w["start"] < clip_end
+        if w["end"] > clip_start and w["start"] < clip_end and w["word"].strip()
     ]
 
-    chunk_size = cfg["chunk_size"]
+    if theme == "hype_gaming":
+        primary_color = "&H0000FFFF"   # Yellow highlight
+        secondary_color = "&H00FFFFFF" # White base
+        outline_color = "&H00000000"
+    elif theme == "editorial_podcast":
+        primary_color = "&H0000E5FF"   # Gold/Amber highlight
+        secondary_color = "&H00FFFFFF"
+        outline_color = "&H00101010"
+    else:
+        primary_color = "&H0055FF55"   # Vibrant green highlight
+        secondary_color = "&H00FFFFFF"
+        outline_color = "&H00000000"
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: HookBanner,Montserrat ExtraBold,64,&H00000000,&H00000000,&H0000FFFF,&H0000FFFF,-1,0,0,0,100,100,0,0,3,18,0,8,60,60,180,1
+Style: KineticCaption,Montserrat ExtraBold,86,{primary_color},{secondary_color},{outline_color},&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,60,60,340,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    duration = max(1.0, clip_end - clip_start)
+    events = [
+        f"Dialogue: 1,0:00:00.00,{format_ass_time(duration)},HookBanner,,0,0,0,,{{\\fad(200,200)}}{title.upper()}"
+    ]
+
+    # Group into punchy 3-word chunks with active word pop animation
+    chunk_size = 3
     for i in range(0, len(clip_words), chunk_size):
-        chunk = clip_words[i:i + chunk_size]
-        for active_idx, active_word in enumerate(chunk):
-            start_ms = int(active_word["start"] * 1000)
-            end_ms = int(active_word["end"] * 1000)
-            if end_ms <= start_ms:
-                continue
+        chunk = clip_words[i : i + chunk_size]
+        for active_idx, active_w in enumerate(chunk):
+            seg_start = active_w["start"]
+            seg_end = chunk[active_idx + 1]["start"] if active_idx + 1 < len(chunk) else active_w["end"]
+            if seg_end <= seg_start:
+                seg_end = seg_start + 0.12
 
-            parts = []
-            for idx, item in enumerate(chunk):
-                if idx == active_idx:
-                    # Pop-in scale bounce (\fscx115\fscy115 -> \fscx100\fscy100) + color highlight
-                    anim = r"{" + cfg["highlight"] + r"\fscx118\fscy118\t(0,90,\fscx100\fscy100)}"
-                    reset = r"{\c&HFFFFFF&\fscx100\fscy100}"
-                    parts.append(f"{anim}{item['word']}{reset}")
+            styled_tokens = []
+            for j, token in enumerate(chunk):
+                clean_txt = token["word"].replace("{", "").replace("}", "")
+                if j == active_idx:
+                    styled_tokens.append(f"{{\\c{primary_color}\\fscx112\\fscy112}}{clean_txt}{{\\r}}")
                 else:
-                    parts.append(item["word"])
+                    styled_tokens.append(f"{{\\c{secondary_color}}}{clean_txt}")
 
-            subs.events.append(pysubs2.SSAEvent(
-                start=start_ms,
-                end=end_ms,
-                style="Default",
-                text=" ".join(parts)
-            ))
+            line_text = " ".join(styled_tokens)
+            events.append(
+                f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(seg_end)},KineticCaption,,0,0,0,,{line_text}"
+            )
 
-    subs.save(ass_path)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(events) + "\n")
 
-def render_adaptive_video(raw_cut, output_video, mode, clip_start, peak_moments):
+def detect_faces_tasks(detector, frame_bgr):
+    """Returns list of normalized (cx, cy) face centers using MediaPipe Tasks Vision API."""
+    h, w, _ = frame_bgr.shape
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = detector.detect(mp_image)
+    centers = []
+    for det in result.detections:
+        bbox = det.bounding_box
+        cx = (bbox.origin_x + bbox.width / 2.0) / float(w)
+        cy = (bbox.origin_y + bbox.height / 2.0) / float(h)
+        centers.append((max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy))))
+    return centers
+
+def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start: float, peaks: list):
     cap = cv2.VideoCapture(raw_cut)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    out_w, out_h = 1080, 1920
+    temp_silent = rendered_vid.replace(".mp4", "_silent.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_video, fourcc, fps, (1080, 1920))
+    writer = cv2.VideoWriter(temp_silent, fourcc, fps, (out_w, out_h))
 
-    mp_face = mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+    # Initialize modern MediaPipe Tasks FaceDetector with OpenCV Haar fallback
+    detector = None
+    haar_cascade = None
+    try:
+        ensure_face_model()
+        base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = mp_vision.FaceDetectorOptions(base_options=base_options, min_detection_confidence=0.5)
+        detector = mp_vision.FaceDetector.create_from_options(options)
+    except Exception as e:
+        print(f"⚠️ MediaPipe Tasks init fallback ({e}), using OpenCV Haar Cascade...", flush=True)
+        haar_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-    # Convert peak timestamps relative to clip start
-    rel_peaks = [p - clip_start for p in peak_moments if p >= clip_start]
-
-    smooth_x = orig_w / 2.0
-    left_speaker_x = orig_w * 0.28
-    right_speaker_x = orig_w * 0.72
+    rel_peaks = [p - clip_start for p in peaks if p >= clip_start]
+    smooth_cx = 0.5
+    left_cx, right_cx = 0.28, 0.72
     frame_idx = 0
 
     while True:
@@ -136,105 +145,96 @@ def render_adaptive_video(raw_cut, output_video, mode, clip_start, peak_moments)
         if not ret:
             break
 
-        current_sec = frame_idx / fps
-        frame_idx += 1
+        t_sec = frame_idx / fps
 
-        # Calculate dynamic zoom punch if near a peak moment (0.45s decay)
-        zoom_factor = 1.0
+        # Zoom-punch envelope on peak moments (1.0 -> 1.14 -> 1.0 over 0.45s)
+        zoom = 1.0
         for pk in rel_peaks:
-            dt = current_sec - pk
+            dt = t_sec - pk
             if 0.0 <= dt <= 0.45:
-                zoom_factor = 1.0 + 0.12 * (1.0 - (dt / 0.45))
+                zoom = 1.0 + 0.14 * math.sin((dt / 0.45) * math.pi)
                 break
 
-        # Subtle periodic retention zoom on explainer/single podcast every 7 seconds
-        if mode in ("explainer", "podcast_single") and zoom_factor == 1.0:
-            cycle = current_sec % 7.0
-            if 3.5 <= cycle <= 6.8:
-                zoom_factor = 1.05
+        # Detect faces every 5 frames for speed + smooth exponential tracking
+        if frame_idx % 5 == 0 and mode in ("podcast_single", "podcast_dual"):
+            centers = []
+            if detector is not None:
+                centers = detect_faces_tasks(detector, frame)
+            elif haar_cascade is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                rects = haar_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(40, 40))
+                centers = [((x + w / 2.0) / src_w, (y + h / 2.0) / src_h) for (x, y, w, h) in rects]
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = mp_face.process(rgb)
-        detections = results.detections if results.detections else []
+            if centers:
+                if mode == "podcast_single":
+                    target_cx = centers[0][0]
+                    smooth_cx = 0.85 * smooth_cx + 0.15 * target_cx
+                elif mode == "podcast_dual":
+                    left_faces = [c[0] for c in centers if c[0] < 0.5]
+                    right_faces = [c[0] for c in centers if c[0] >= 0.5]
+                    if left_faces:
+                        left_cx = 0.85 * left_cx + 0.15 * left_faces[0]
+                    if right_faces:
+                        right_cx = 0.85 * right_cx + 0.15 * right_faces[0]
 
-        # MODE 1: GAMING ACTION (Blurred full-height background + Crisp uncropped 16:9 gameplay + Facecam overlay)
-        if mode == "gaming_action":
-            # Blurred ambient background
-            bg_crop_w = int(orig_h * (9 / 16))
-            bg_x1 = max(0, (orig_w - bg_crop_w) // 2)
-            bg = cv2.resize(frame[:, bg_x1:bg_x1 + bg_crop_w], (1080, 1920))
-            bg = cv2.GaussianBlur(bg, (75, 75), 0)
-            bg = cv2.convertScaleAbs(bg, alpha=0.55, beta=0)
+        if mode == "podcast_dual":
+            # Top half: Speaker 1 (9:8 aspect), Bottom half: Speaker 2 (9:8 aspect)
+            half_h = out_h // 2
+            crop_w = int(src_h * (out_w / half_h) / zoom)
+            crop_h = int(src_h / zoom)
+            crop_w = min(src_w, max(64, crop_w))
+            crop_h = min(src_h, max(64, crop_h))
+            y1 = max(0, (src_h - crop_h) // 2)
 
-            # Apply zoom punch to gameplay center
-            zh, zw = int(orig_h / zoom_factor), int(orig_w / zoom_factor)
-            zy1, zx1 = (orig_h - zh) // 2, (orig_w - zw) // 2
-            zoomed_game = frame[zy1:zy1 + zh, zx1:zx1 + zw]
+            x1_top = int(np.clip(left_cx * src_w - crop_w / 2, 0, max(0, src_w - crop_w)))
+            x1_bot = int(np.clip(right_cx * src_w - crop_w / 2, 0, max(0, src_w - crop_w)))
 
-            fg_h = int(1080 * (orig_h / orig_w))
-            fg = cv2.resize(zoomed_game, (1080, fg_h), interpolation=cv2.INTER_LANCZOS4)
+            top_crop = cv2.resize(frame[y1 : y1 + crop_h, x1_top : x1_top + crop_w], (out_w, half_h), interpolation=cv2.INTER_LANCZOS4)
+            bot_crop = cv2.resize(frame[y1 : y1 + crop_h, x1_bot : x1_bot + crop_w], (out_w, half_h), interpolation=cv2.INTER_LANCZOS4)
+            canvas = np.vstack([top_crop, bot_crop])
 
-            y_offset = (1920 - fg_h) // 2 + 60
-            bg[y_offset:y_offset + fg_h, 0:1080] = fg
-
-            # If a facecam is detected in corners, crop & place cleanly above gameplay
-            if detections:
-                det = detections[0].location_data.relative_bounding_box
-                fx = int((det.xmin + det.width / 2) * orig_w)
-                fy = int((det.ymin + det.height / 2) * orig_h)
-                cam_size = int(orig_h * 0.28)
-                cx1 = max(0, min(orig_w - cam_size, fx - cam_size // 2))
-                cy1 = max(0, min(orig_h - cam_size, fy - cam_size // 2))
-                cam_crop = cv2.resize(frame[cy1:cy1 + cam_size, cx1:cx1 + cam_size], (340, 340))
-                # White border around facecam
-                cam_bordered = cv2.copyMakeBorder(cam_crop, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-                bg[300:652, 364:716] = cam_bordered
-
+        elif mode == "gaming_action":
+            # Blurred full-frame background + sharp 16:9 centered gameplay so HUD/minimap stay 100% visible
+            bg = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            bg = cv2.GaussianBlur(bg, (51, 51), 0)
+            fg_w = out_w
+            fg_h = int(out_w * (src_h / src_w))
+            fg = cv2.resize(frame, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+            y_offset = (out_h - fg_h) // 2
             canvas = bg
+            canvas[y_offset : y_offset + fg_h, 0:out_w] = fg
 
-        # MODE 2: PODCAST DUAL SPLIT-SCREEN (Top Speaker + Bottom Speaker stacked 1080x960 each)
-        elif mode == "podcast_dual":
-            if len(detections) >= 2:
-                xs = sorted([(d.location_data.relative_bounding_box.xmin + d.location_data.relative_bounding_box.width / 2) * orig_w for d in detections[:2]])
-                left_speaker_x = 0.85 * left_speaker_x + 0.15 * xs[0]
-                right_speaker_x = 0.85 * right_speaker_x + 0.15 * xs[1]
-
-            # Each half needs 1080x960 aspect ratio (1.125:1)
-            half_crop_h = orig_h
-            half_crop_w = min(orig_w // 2, int(half_crop_h * (1080 / 960)))
-
-            lx1 = int(max(0, min(orig_w - half_crop_w, left_speaker_x - half_crop_w / 2)))
-            rx1 = int(max(0, min(orig_w - half_crop_w, right_speaker_x - half_crop_w / 2)))
-
-            top_half = cv2.resize(frame[:, lx1:lx1 + half_crop_w], (1080, 960), interpolation=cv2.INTER_LANCZOS4)
-            bot_half = cv2.resize(frame[:, rx1:rx1 + half_crop_w], (1080, 960), interpolation=cv2.INTER_LANCZOS4)
-
-            canvas = np.vstack([top_half, bot_half])
-            # Clean 4px divider line between speakers
-            cv2.line(canvas, (0, 960), (1080, 960), (255, 255, 255), 4)
-
-        # MODE 3: SINGLE SPEAKER / EXPLAINER (Smooth Face-Tracked 9:16 + Dynamic Zoom)
         else:
-            if detections:
-                best = max(detections, key=lambda d: d.location_data.relative_bounding_box.width)
-                bbox = best.location_data.relative_bounding_box
-                target_x = (bbox.xmin + bbox.width / 2.0) * orig_w
-                if abs(target_x - smooth_x) > orig_w * 0.04:
-                    smooth_x = 0.08 * target_x + 0.92 * smooth_x
+            # podcast_single / explainer: Dynamic 9:16 active face-tracked crop
+            crop_h = int(src_h / zoom)
+            crop_w = int(crop_h * (out_w / out_h))
+            crop_w = min(src_w, max(64, crop_w))
+            crop_h = min(src_h, max(64, crop_h))
+            x1 = int(np.clip(smooth_cx * src_w - crop_w / 2, 0, max(0, src_w - crop_w)))
+            y1 = max(0, (src_h - crop_h) // 2)
+            cropped = frame[y1 : y1 + crop_h, x1 : x1 + crop_w]
+            canvas = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
 
-            crop_h = int(orig_h / zoom_factor)
-            crop_w = int(crop_h * (9 / 16))
-            x1 = int(max(0, min(orig_w - crop_w, smooth_x - crop_w / 2)))
-            y1 = (orig_h - crop_h) // 2
-
-            cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
-            canvas = cv2.resize(cropped, (1080, 1920), interpolation=cv2.INTER_LANCZOS4)
-
-        out.write(canvas)
+        writer.write(canvas)
+        frame_idx += 1
 
     cap.release()
-    out.release()
-    mp_face.close()
+    writer.release()
+    if detector is not None:
+        detector.close()
+
+    # Mux original crystal-clear audio back onto the tracked video
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-y",
+        "-i", temp_silent, "-i", raw_cut,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "192k",
+        rendered_vid
+    ], check=True)
+
+    if os.path.exists(temp_silent):
+        os.remove(temp_silent)
 
 def main():
     os.makedirs("final_reels", exist_ok=True)
@@ -243,57 +243,52 @@ def main():
     with open("work/words.json", "r", encoding="utf-8") as f:
         words = json.load(f)
 
-    for idx, clip in enumerate(blueprint["clips"], start=1):
-        start = clip["start_time"]
-        end = clip["end_time"]
-        duration = end - start
-        mode = clip["content_mode"]
-        theme = clip["caption_theme"]
-        title = clip["title"]
+    master_video = "work/master.mp4"
+    clips = blueprint.get("clips", [])
+
+    for idx, clip in enumerate(clips, start=1):
+        start = float(clip["start_time"])
+        end = float(clip["end_time"])
+        duration = max(5.0, end - start)
+        mode = clip.get("content_mode", "podcast_single")
+        theme = clip.get("caption_theme", "editorial_podcast")
+        title = clip.get("title", f"CLIP {idx}")
         peaks = clip.get("peak_moments", [])
 
-        safe_name = "".join(c if c.isalnum() or c in " _-" else "" for c in title).strip().replace(" ", "_")
+        print(f"=== Building Reel {idx} [{mode.upper()}]: {title} ({start}s - {end}s) ===", flush=True)
+
         raw_cut = f"work/cut_{idx}.mp4"
-        rendered_vid = f"work/vert_{idx}.mp4"
-        ass_file = f"work/subs_{idx}.ass"
-        final_reel = f"final_reels/Reel_{idx}_{mode}_{safe_name[:25]}.mp4"
+        rendered_vid = f"work/tracked_{idx}.mp4"
+        ass_path = f"work/subs_{idx}.ass"
+        final_out = f"final_reels/reel_{idx}_{mode}.mp4"
 
-        print(f"\n=== Building Reel {idx} [{mode.upper()}]: {title} ({start}s - {end}s) ===")
-
-        # 1. Extract lossless-grade segment
+        # 1. Exact frame-accurate slice from 1080p master
         subprocess.run([
-            "ffmpeg", "-nostdin", "-y", "-ss", str(start), "-i", "work/master.mp4",
-            "-t", str(duration), "-c:v", "libx264", "-crf", "15", "-preset", "veryfast",
-            "-c:a", "aac", "-b:a", "192k", raw_cut
+            "ffmpeg", "-nostdin", "-y",
+            "-ss", str(start), "-i", master_video, "-t", str(duration),
+            "-c:v", "libx264", "-crf", "17", "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "192k",
+            raw_cut
         ], check=True)
 
-        # 2. Adaptive Layout & Dynamic Physics Render
+        # 2. Adaptive 9:16 tracking, dual split-screen, or gaming HUD layout + zoom physics
         render_adaptive_video(raw_cut, rendered_vid, mode, start, peaks)
 
-        # 3. Generate Animated Pop-In Captions + Hook Banner
-        build_dynamic_captions(words, start, end, theme, title, ass_file)
+        # 3. Generate kinetic word-by-word ASS captions + top hook banner
+        generate_ass_subtitles(words, start, end, title, theme, ass_path)
 
-        # 4. Final Studio Master Encode (CRF 18 + Broadcast Loudnorm)
+        # 4. Burn captions + normalize audio loudness (-14 LUFS broadcast standard)
         subprocess.run([
             "ffmpeg", "-nostdin", "-y",
             "-i", rendered_vid,
-            "-i", raw_cut,
-            "-vf", f"ass={ass_file}:fontsdir=fonts",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "libx264",
-            "-crf", "18",
-            "-preset", "medium",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ar", "48000",
+            "-vf", f"ass={ass_path}:fontsdir=fonts",
             "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-            "-movflags", "+faststart",
-            final_reel
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "192k",
+            final_out
         ], check=True)
 
-        print(f"✅ Mastered Reel saved: {final_reel}")
+        print(f"✅ Finished {final_out}", flush=True)
 
 if __name__ == "__main__":
     main()
