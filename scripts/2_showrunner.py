@@ -150,41 +150,52 @@ TRANSCRIPT:
 
     schema = Blueprint.model_json_schema()
     bp = None
+    last_good = None
     feedback = ""
     for iteration in range(3):
-        prompt = director_prompt + (f"\nPREVIOUS PICKS REJECTED BY CRICIC, fix these issues and pick better/alternative segments:\n{feedback}" if feedback else "")
-        txt = openrouter_chat(BRAIN_POOL, [{"role": "user", "content": prompt}],
-                              temperature=0.35, schema_hint=schema)
+        prompt = director_prompt + (
+            f"\nPREVIOUS PICKS REJECTED BY CRITIC, fix these issues and pick better/alternative segments:\n{feedback}"
+            if feedback else "")
         try:
+            txt = openrouter_chat(BRAIN_POOL, [{"role": "user", "content": prompt}],
+                                  temperature=0.35, schema_hint=schema)
             bp = Blueprint.model_validate(extract_json(txt))
-        except ValidationError as e:
-            print(f"⚠️ blueprint validation failed ({e}); retrying", flush=True)
-            feedback = f"JSON schema violation: {str(e)[:500]}"
+        except Exception as e:
+            print(f"⚠️ director attempt failed ({str(e)[:200]})", flush=True)
+            if last_good is not None:
+                print("↩️ re-pick failed; keeping last grounded blueprint", flush=True)
+                bp = last_good
+                break
+            feedback = f"Previous attempt errored: {str(e)[:300]}. Return ONLY valid JSON."
+            bp = None
             continue
         bp = ground(bp, duration, words, gaps, energy["peaks"])
         if not bp.clips:
             feedback = "No valid clips survived grounding; pick different segments."
+            bp = None
             continue
+        last_good = bp
 
         # ---- CRITIC PASS ----
         critic_payload = "\n\n".join(
             f"CLIP {i} [{c.start_time:.1f}-{c.end_time:.1f}] hook='{c.title}'\n{clip_transcript(words, c.start_time, c.end_time)}"
             for i, c in enumerate(bp.clips))
-        ctxt = openrouter_chat(BRAIN_POOL, [{"role": "user", "content":
-            f"You are a ruthless retention critic. For each clip judge: does the hook land in the "
-            f"first 3 seconds, is the payoff complete inside the clip, does it stand alone without "
-            f"context? Return items with index, keep (bool), hook_strength 1-10, payoff_complete, "
-            f"standalone, issue.\n\n{critic_payload}"}],
-            temperature=0.1, schema_hint=CriticReport.model_json_schema())
         try:
+            ctxt = openrouter_chat(BRAIN_POOL, [{"role": "user", "content":
+                f"You are a ruthless retention critic. For each clip judge: does the hook land in the "
+                f"first 3 seconds, is the payoff complete inside the clip, does it stand alone without "
+                f"context? Return items with index, keep (bool), hook_strength 1-10, payoff_complete, "
+                f"standalone, issue.\n\n{critic_payload}"}],
+                temperature=0.1, schema_hint=CriticReport.model_json_schema())
             report = CriticReport.model_validate(extract_json(ctxt))
-        except ValidationError:
-            print("⚠️ critic parse failed; accepting grounded blueprint", flush=True)
+        except Exception as e:
+            print(f"⚠️ critic failed ({str(e)[:160]}); accepting grounded blueprint", flush=True)
             break
-        bad = [it for it in report.items if not it.keep or it.hook_strength < 6
-               or not it.payoff_complete or not it.standalone]
-        if not bad:
-            print("✅ critic approved all clips", flush=True)
+        bad = [it for it in report.items
+               if (not it.keep) or (not it.payoff_complete) or (not it.standalone)
+               or it.hook_strength < 5]
+        if not bad or iteration == 2:
+            print("✅ critic approved (or final iteration); locking blueprint", flush=True)
             break
         feedback = "\n".join(f"clip {it.index}: {it.issue or 'weak hook/incomplete payoff'}" for it in bad)
         print(f"🔁 critic rejected {len(bad)} clips, re-picking (iter {iteration+1})", flush=True)
