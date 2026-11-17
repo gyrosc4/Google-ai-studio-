@@ -35,13 +35,22 @@ def main():
     audio_wav = "work/audio.wav"
 
     print("1. Downloading 1080p master stream via yt-dlp...")
-    subprocess.run([
+    yt_cmd = [
         "yt-dlp",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
+        "--extractor-args", "youtube:player_client=default,tv_embedded",
         "-o", master_video,
-        VIDEO_URL
-    ], check=True)
+    ]
+
+    yt_cookies = os.environ.get("YT_COOKIES", "").strip()
+    if yt_cookies:
+        with open("work/cookies.txt", "w", encoding="utf-8") as cf:
+            cf.write(yt_cookies)
+        yt_cmd.extend(["--cookies", "work/cookies.txt"])
+
+    yt_cmd.append(VIDEO_URL)
+    subprocess.run(yt_cmd, check=True)
 
     print("2. Creating lightweight multimodal proxy for Gemini Vision+Audio analysis...")
     subprocess.run([
