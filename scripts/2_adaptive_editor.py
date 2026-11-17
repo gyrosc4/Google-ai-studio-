@@ -11,11 +11,22 @@ from mediapipe.tasks.python import vision as mp_vision
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
 MODEL_PATH = "work/blaze_face_short_range.tflite"
+HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/data/haarcascades/haarcascade_frontalface_default.xml"
+HAAR_PATH = "work/haarcascade_frontalface_default.xml"
 
-def ensure_face_model():
+def ensure_face_models():
     if not os.path.exists(MODEL_PATH):
-        print("Downloading MediaPipe BlazeFace task model...", flush=True)
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        try:
+            print("Downloading MediaPipe BlazeFace task model...", flush=True)
+            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        except Exception as e:
+            print(f"⚠️ BlazeFace download skipped: {e}", flush=True)
+
+    if not os.path.exists(HAAR_PATH):
+        try:
+            urllib.request.urlretrieve(HAAR_URL, HAAR_PATH)
+        except Exception:
+            pass
 
 def format_ass_time(seconds: float) -> str:
     seconds = max(0.0, seconds)
@@ -72,7 +83,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f"Dialogue: 1,0:00:00.00,{format_ass_time(duration)},HookBanner,,0,0,0,,{{\\fad(200,200)}}{title.upper()}"
     ]
 
-    # Group into punchy 3-word chunks with active word pop animation
     chunk_size = 3
     for i in range(0, len(clip_words), chunk_size):
         chunk = clip_words[i : i + chunk_size]
@@ -99,7 +109,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(header + "\n".join(events) + "\n")
 
 def detect_faces_tasks(detector, frame_bgr):
-    """Returns list of normalized (cx, cy) face centers using MediaPipe Tasks Vision API."""
     h, w, _ = frame_bgr.shape
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -123,17 +132,35 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(temp_silent, fourcc, fps, (out_w, out_h))
 
-    # Initialize modern MediaPipe Tasks FaceDetector with OpenCV Haar fallback
+    ensure_face_models()
     detector = None
     haar_cascade = None
-    try:
-        ensure_face_model()
-        base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-        options = mp_vision.FaceDetectorOptions(base_options=base_options, min_detection_confidence=0.5)
-        detector = mp_vision.FaceDetector.create_from_options(options)
-    except Exception as e:
-        print(f"⚠️ MediaPipe Tasks init fallback ({e}), using OpenCV Haar Cascade...", flush=True)
-        haar_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    # 1. Try MediaPipe Tasks CPU delegate
+    if os.path.exists(MODEL_PATH):
+        try:
+            base_options = mp_python.BaseOptions(
+                model_asset_path=MODEL_PATH,
+                delegate=mp_python.BaseOptions.Delegate.CPU
+            )
+            options = mp_vision.FaceDetectorOptions(base_options=base_options, min_detection_confidence=0.5)
+            detector = mp_vision.FaceDetector.create_from_options(options)
+            print("Face tracker: MediaPipe BlazeFace (CPU) active.", flush=True)
+        except Exception as e:
+            print(f"⚠️ MediaPipe CPU init failed ({e}), trying Haar Cascade...", flush=True)
+
+    # 2. Fallback to OpenCV Haar Cascade (verified non-empty)
+    if detector is None:
+        for xml_candidate in [HAAR_PATH, getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"]:
+            if xml_candidate and os.path.exists(xml_candidate):
+                clf = cv2.CascadeClassifier(xml_candidate)
+                if not clf.empty():
+                    haar_cascade = clf
+                    print(f"Face tracker: OpenCV Haar Cascade loaded from {xml_candidate}.", flush=True)
+                    break
+
+    if detector is None and haar_cascade is None:
+        print("⚠️ No face detector available; using smooth center framing.", flush=True)
 
     rel_peaks = [p - clip_start for p in peaks if p >= clip_start]
     smooth_cx = 0.5
@@ -147,7 +174,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
 
         t_sec = frame_idx / fps
 
-        # Zoom-punch envelope on peak moments (1.0 -> 1.14 -> 1.0 over 0.45s)
         zoom = 1.0
         for pk in rel_peaks:
             dt = t_sec - pk
@@ -155,7 +181,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
                 zoom = 1.0 + 0.14 * math.sin((dt / 0.45) * math.pi)
                 break
 
-        # Detect faces every 5 frames for speed + smooth exponential tracking
         if frame_idx % 5 == 0 and mode in ("podcast_single", "podcast_dual"):
             centers = []
             if detector is not None:
@@ -178,7 +203,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
                         right_cx = 0.85 * right_cx + 0.15 * right_faces[0]
 
         if mode == "podcast_dual":
-            # Top half: Speaker 1 (9:8 aspect), Bottom half: Speaker 2 (9:8 aspect)
             half_h = out_h // 2
             crop_w = int(src_h * (out_w / half_h) / zoom)
             crop_h = int(src_h / zoom)
@@ -194,7 +218,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
             canvas = np.vstack([top_crop, bot_crop])
 
         elif mode == "gaming_action":
-            # Blurred full-frame background + sharp 16:9 centered gameplay so HUD/minimap stay 100% visible
             bg = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
             bg = cv2.GaussianBlur(bg, (51, 51), 0)
             fg_w = out_w
@@ -205,7 +228,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
             canvas[y_offset : y_offset + fg_h, 0:out_w] = fg
 
         else:
-            # podcast_single / explainer: Dynamic 9:16 active face-tracked crop
             crop_h = int(src_h / zoom)
             crop_w = int(crop_h * (out_w / out_h))
             crop_w = min(src_w, max(64, crop_w))
@@ -223,7 +245,6 @@ def render_adaptive_video(raw_cut: str, rendered_vid: str, mode: str, clip_start
     if detector is not None:
         detector.close()
 
-    # Mux original crystal-clear audio back onto the tracked video
     subprocess.run([
         "ffmpeg", "-nostdin", "-y",
         "-i", temp_silent, "-i", raw_cut,
@@ -262,7 +283,6 @@ def main():
         ass_path = f"work/subs_{idx}.ass"
         final_out = f"final_reels/reel_{idx}_{mode}.mp4"
 
-        # 1. Exact frame-accurate slice from 1080p master
         subprocess.run([
             "ffmpeg", "-nostdin", "-y",
             "-ss", str(start), "-i", master_video, "-t", str(duration),
@@ -271,13 +291,9 @@ def main():
             raw_cut
         ], check=True)
 
-        # 2. Adaptive 9:16 tracking, dual split-screen, or gaming HUD layout + zoom physics
         render_adaptive_video(raw_cut, rendered_vid, mode, start, peaks)
-
-        # 3. Generate kinetic word-by-word ASS captions + top hook banner
         generate_ass_subtitles(words, start, end, title, theme, ass_path)
 
-        # 4. Burn captions + normalize audio loudness (-14 LUFS broadcast standard)
         subprocess.run([
             "ffmpeg", "-nostdin", "-y",
             "-i", rendered_vid,
