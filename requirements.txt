@@ -1,0 +1,10 @@
+yt-dlp
+faster-whisper
+google-genai
+pydantic
+opencv-python-headless
+mediapipe
+numpy
+scipy
+pysubs2
+requests
