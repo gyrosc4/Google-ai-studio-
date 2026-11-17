@@ -1,0 +1,58 @@
+name: AI Multimodal Reels Studio
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube Video / Stream URL'
+        required: true
+        type: string
+
+jobs:
+  produce-reels:
+    runs-on: ubuntu-latest
+    env:
+      VIDEO_URL: ${{ github.event.inputs.youtube_url }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 fonts-liberation
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Step 1 - Multimodal Vision + Audio Analysis
+        run: python scripts/1_multimodal_director.py
+
+      - name: Step 2 - Adaptive Reframe, Zoom Physics & Captions
+        run: python scripts/2_adaptive_editor.py
+
+      - name: Step 3 - Deliver Masters to Telegram
+        run: |
+          for reel in final_reels/*.mp4; do
+            [ -e "$reel" ] || continue
+            FILENAME=$(basename "$reel")
+            curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
+                 -F video=@"$reel" \
+                 -F caption="🎬 $FILENAME" \
+                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendVideo" > /dev/null
+          done
+
+      - name: Archive High-Bitrate Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-reels-masters
+          path: final_reels/
