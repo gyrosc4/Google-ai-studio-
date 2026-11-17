@@ -16,6 +16,7 @@ jobs:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      YT_COOKIES: ${{ secrets.YT_COOKIES }}
 
     steps:
       - name: Checkout Repository
@@ -27,12 +28,18 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Install Deno JS Runtime for yt-dlp
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 fonts-liberation
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install --upgrade --pre "yt-dlp[default]"
 
       - name: Step 1 - Multimodal Vision + Audio Analysis
         run: python scripts/1_multimodal_director.py
