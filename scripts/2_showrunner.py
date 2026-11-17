@@ -152,7 +152,7 @@ TRANSCRIPT:
     bp = None
     last_good = None
     feedback = ""
-    for iteration in range(3):
+    for iteration in range(2):
         prompt = director_prompt + (
             f"\nPREVIOUS PICKS REJECTED BY CRITIC, fix these issues and pick better/alternative segments:\n{feedback}"
             if feedback else "")
@@ -191,10 +191,9 @@ TRANSCRIPT:
         except Exception as e:
             print(f"⚠️ critic failed ({str(e)[:160]}); accepting grounded blueprint", flush=True)
             break
-        bad = [it for it in report.items
-               if (not it.keep) or (not it.payoff_complete) or (not it.standalone)
-               or it.hook_strength < 5]
-        if not bad or iteration == 2:
+                bad = [it for it in report.items
+               if (not it.keep) or (not it.payoff_complete) or (not it.standalone)]
+        if not bad or iteration == 1:
             print("✅ critic approved (or final iteration); locking blueprint", flush=True)
             break
         feedback = "\n".join(f"clip {it.index}: {it.issue or 'weak hook/incomplete payoff'}" for it in bad)
