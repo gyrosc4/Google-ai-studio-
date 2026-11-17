@@ -3,14 +3,28 @@ import time
 import json
 import subprocess
 from typing import Literal
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
 VIDEO_URL = os.environ["VIDEO_URL"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MODEL_NAME = "gemini-3.8-flash"
+
+# Preferred order of active multimodal models (Flash/Pro/Lite)
+PREFERRED_MODEL_ORDER = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+]
+
+EXCLUDED_KEYWORDS = ("tts", "live", "image", "nano-banana", "omni", "transcribe", "translate", "embedding", "robotics", "deep-research")
 
 class ClipDirective(BaseModel):
     title: str = Field(description="Punchy 3-5 word viral hook banner text for the top of the Reel")
@@ -38,6 +52,55 @@ def get_video_duration(video_path: str) -> float:
         capture_output=True, text=True, check=True
     )
     return float(result.stdout.strip())
+
+def get_available_models(client) -> list[str]:
+    """Queries the Gemini API live for all active multimodal content-generation models."""
+    discovered = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" not in methods:
+                continue
+            if not name.startswith("gemini-"):
+                continue
+            if any(bad in name.lower() for bad in EXCLUDED_KEYWORDS):
+                continue
+            discovered.append(name)
+    except Exception as e:
+        print(f"⚠️ Could not list models dynamically ({e}), using built-in priority list.", flush=True)
+        return PREFERRED_MODEL_ORDER
+
+    # Order discovered models by PREFERRED_MODEL_ORDER first, then any newer models alphabetically
+    ordered = [m for m in PREFERRED_MODEL_ORDER if m in discovered]
+    extras = sorted([m for m in discovered if m not in ordered], reverse=True)
+    final_list = ordered + extras
+    print(f"Discovered active Gemini models: {final_list}", flush=True)
+    return final_list if final_list else PREFERRED_MODEL_ORDER
+
+def generate_with_dynamic_failover(client, model_pool: list[str], contents, prompt_text):
+    last_error = None
+    for model_name in model_pool:
+        try:
+            print(f"Trying {model_name}...", flush=True)
+            return client.models.generate_content(
+                model=model_name,
+                contents=[*contents, prompt_text],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=DirectorBlueprint,
+                    temperature=0.25
+                ),
+            )
+        except Exception as e:
+            last_error = e
+            err_str = str(e)
+            # If video input hits token limit or unsupported media on a specific model, bubble up if all fail
+            if "INVALID_ARGUMENT" in err_str and ("token" in err_str.lower() or "exceeds" in err_str.lower()):
+                raise e
+            print(f"⚠️ {model_name} unavailable/busy ({err_str[:140]}), failing over immediately...", flush=True)
+            time.sleep(2)
+    raise RuntimeError(f"All available models failed: {last_error}")
 
 def main():
     os.makedirs("work", exist_ok=True)
@@ -67,15 +130,14 @@ def main():
     duration_min = duration_sec / 60.0
     print(f"Video duration detected: {duration_min:.1f} minutes ({duration_sec:.0f}s)", flush=True)
 
-    # Dynamically scale proxy FPS so total tokens stay safely under 800k even on 3+ hour videos
     if duration_min <= 40:
         proxy_fps = "2"
     elif duration_min <= 110:
         proxy_fps = "1"
     else:
-        proxy_fps = "0.5"  # 1 frame every 2 seconds for 2-4 hour VODs
+        proxy_fps = "0.5"
 
-    print(f"2. Creating token-optimized proxy ({proxy_fps} fps) for {MODEL_NAME}...", flush=True)
+    print(f"2. Creating token-optimized proxy ({proxy_fps} fps)...", flush=True)
     subprocess.run([
         "ffmpeg", "-nostdin", "-y", "-i", master_video,
         "-vf", f"scale=-2:360,fps={proxy_fps}",
@@ -91,9 +153,10 @@ def main():
         audio_wav
     ], check=True)
 
-    print("4. Running faster-whisper (small.en + Silero VAD)...", flush=True)
-    model = WhisperModel("small.en", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(audio_wav, word_timestamps=True, vad_filter=True)
+    print("4. Running Batched faster-whisper (base.en, batch_size=8)...", flush=True)
+    base_model = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=4)
+    batched_model = BatchedInferencePipeline(model=base_model)
+    segments, _ = batched_model.transcribe(audio_wav, batch_size=8, word_timestamps=True)
 
     transcript_lines = []
     word_timeline = []
@@ -112,6 +175,7 @@ def main():
 
     full_transcript = "\n".join(transcript_lines)
     client = genai.Client(api_key=GEMINI_API_KEY)
+    model_pool = get_available_models(client)
 
     base_prompt = f"""
     You are an elite viral short-form video director (Alex Hormozi / top Twitch & Podcast clipper level).
@@ -137,7 +201,7 @@ def main():
 
     uploaded_file = None
     try:
-        print(f"5. Uploading proxy video to {MODEL_NAME} for multimodal analysis...", flush=True)
+        print("5. Uploading proxy video to Gemini File API for multimodal analysis...", flush=True)
         uploaded_file = client.files.upload(file=proxy_video)
 
         while uploaded_file.state.name == "PROCESSING":
@@ -147,18 +211,9 @@ def main():
         if uploaded_file.state.name != "ACTIVE":
             raise RuntimeError(f"Gemini file processing failed: {uploaded_file.state.name}")
 
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[uploaded_file, base_prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=DirectorBlueprint,
-                temperature=0.25
-            ),
-        )
+        response = generate_with_dynamic_failover(client, model_pool, [uploaded_file], base_prompt)
     except Exception as e:
-        print(f"⚠️ Multimodal video upload hit limit or error ({e}). Falling back to transcript + keyframe analysis...", flush=True)
-        # Extract 6 evenly spaced keyframes so Gemini still sees visual layout (Podcast vs Gaming)
+        print(f"⚠️ Video upload path fell back ({e}). Running keyframe + transcript analysis...", flush=True)
         keyframe_parts = []
         for idx, pct in enumerate([0.1, 0.25, 0.45, 0.65, 0.8, 0.92]):
             ts = duration_sec * pct
@@ -171,15 +226,7 @@ def main():
                 with open(img_path, "rb") as img_f:
                     keyframe_parts.append(types.Part.from_bytes(data=img_f.read(), mime_type="image/jpeg"))
 
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[*keyframe_parts, base_prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=DirectorBlueprint,
-                temperature=0.25
-            ),
-        )
+        response = generate_with_dynamic_failover(client, model_pool, keyframe_parts, base_prompt)
     finally:
         if uploaded_file:
             try:
