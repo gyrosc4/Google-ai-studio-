@@ -70,7 +70,7 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
                     "temperature": temperature, "max_tokens": max_tokens}
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
-            if attempt >= 2:
+                        if json_mode:
                 body["reasoning"] = {"enabled": False}
             try:
                 r = requests.post(OR_URL, headers=headers, json=body, timeout=600)
