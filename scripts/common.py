@@ -7,6 +7,7 @@ import subprocess
 import requests
 
 WORK = "work"
+OR_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def run(cmd, **kw):
@@ -32,7 +33,9 @@ def save_json(name, obj):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def extract_json(text: str):
+def extract_json(text):
+    if not text or not isinstance(text, str):
+        raise ValueError(f"model returned no text: {text!r}")
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)
@@ -48,7 +51,9 @@ def extract_json(text: str):
 
 def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
                     json_mode=True, schema_hint=None):
-    """Failover chat across OpenRouter models. Returns raw content text."""
+    """Failover chat across OpenRouter models. Never returns null/empty content.
+    Attempts 0-1 normal; attempts 2-3 disable hidden reasoning (fixes null-content
+    responses from thinking models that spend the whole budget on reasoning)."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
@@ -57,29 +62,37 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
             "role": "user",
             "content": "Respond with ONLY valid JSON matching this schema:\n"
                        + json.dumps(schema_hint)}]
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     last = None
     for model in model_pool:
-        body = {"model": model, "messages": messages,
-                "temperature": temperature, "max_tokens": max_tokens}
-        if json_mode:
-            body["response_format"] = {"type": "json_object"}
-        for attempt in range(3):
+        for attempt in range(4):
+            body = {"model": model, "messages": messages,
+                    "temperature": temperature, "max_tokens": max_tokens}
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+            if attempt >= 2:
+                body["reasoning"] = {"enabled": False}
             try:
-                r = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {key}",
-                             "Content-Type": "application/json"},
-                    json=body, timeout=600)
+                r = requests.post(OR_URL, headers=headers, json=body, timeout=600)
                 if r.status_code == 429:
                     wait = float(r.headers.get("Retry-After", 5))
                     print(f"⏳ {model} 429, waiting {wait}s", flush=True)
                     time.sleep(min(wait, 30))
                     continue
+                if r.status_code == 400 and "reasoning" in body:
+                    body.pop("reasoning")
+                    r = requests.post(OR_URL, headers=headers, json=body, timeout=600)
                 if r.status_code in (402, 404, 400):
                     raise RuntimeError(f"{model} -> {r.status_code} {r.text[:160]}")
                 r.raise_for_status()
                 data = r.json()
-                return data["choices"][0]["message"]["content"]
+                choice = (data.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                content = msg.get("content")
+                if not content or not str(content).strip():
+                    raise RuntimeError(
+                        f"empty/null content (finish_reason={choice.get('finish_reason')})")
+                return content
             except Exception as e:
                 last = e
                 print(f"⚠️ {model} attempt {attempt+1} failed ({str(e)[:140]})", flush=True)
