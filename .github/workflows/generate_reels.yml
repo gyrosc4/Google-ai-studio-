@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       num_reels:
-        description: 'How many reels to produce'
+        description: 'How many reels (1-5)'
         required: false
         default: '3'
         type: string
@@ -18,9 +18,14 @@ on:
         default: 'small'
         type: string
 
+concurrency:
+  group: produce-reels
+  cancel-in-progress: true
+
 jobs:
   produce-reels:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       VIDEO_URL: ${{ github.event.inputs.youtube_url }}
       NUM_REELS: ${{ github.event.inputs.num_reels }}
@@ -73,3 +78,4 @@ jobs:
         with:
           name: studio-reels-masters
           path: final_reels/
+          if-no-files-found: warn
