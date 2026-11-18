@@ -1,5 +1,5 @@
 """Step 4: Telegram delivery. 49MB guard -> compact re-encode -> sendVideo ->
-sendDocument fallback. Real response checking. Never uploads corpses."""
+sendDocument fallback. Real response checking. Prints disk state if empty."""
 import os
 import glob
 import subprocess
@@ -26,6 +26,10 @@ def send(method, path, caption):
 
 
 def main():
+    print("cwd: " + os.getcwd(), flush=True)
+    print("final_reels exists: " + str(os.path.isdir("final_reels")), flush=True)
+    if os.path.isdir("final_reels"):
+        print("contents: " + str(os.listdir("final_reels")), flush=True)
     reels = sorted(glob.glob("final_reels/*.mp4"))
     if not reels:
         raise SystemExit("no reels found in final_reels/")
