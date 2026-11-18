@@ -14,7 +14,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
 
-def ffprobe_duration(path: str) -> float:
+def ffprobe_duration(path):
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
@@ -35,7 +35,7 @@ def save_json(name, obj):
 
 def extract_json(text):
     if not text or not isinstance(text, str):
-        raise ValueError(f"model returned no text: {text!r}")
+        raise ValueError("model returned no text")
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)
@@ -43,7 +43,8 @@ def extract_json(text):
     try:
         return json.loads(text)
     except Exception:
-        s, e = text.find("{"), text.rfind("}")
+        s = text.find("{")
+        e = text.rfind("}")
         if s >= 0 and e > s:
             return json.loads(text[s:e + 1])
         raise
@@ -51,9 +52,9 @@ def extract_json(text):
 
 def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
                     json_mode=True, schema_hint=None):
-    """Failover chat. Hidden reasoning DISABLED for json calls (prevents
-    finish_reason=length null-content burns). Retries 429, strips unsupported
-    reasoning param on 400, rejects empty content, fails over across models."""
+    """Failover chat across OpenRouter models. Hidden reasoning is disabled for
+    JSON calls (prevents null-content token burns). Retries 429, strips an
+    unsupported reasoning param on 400, rejects empty content, fails over."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
@@ -62,7 +63,7 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
             "role": "user",
             "content": "Respond with ONLY valid JSON matching this schema:\n"
                        + json.dumps(schema_hint)}]
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     last = None
     for model in model_pool:
         for attempt in range(4):
@@ -75,43 +76,45 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
                 r = requests.post(OR_URL, headers=headers, json=body, timeout=300)
                 if r.status_code == 429:
                     wait = float(r.headers.get("Retry-After", 5))
-                    print(f"⏳ {model} 429, waiting {wait}s", flush=True)
+                    print("waiting on 429: " + str(wait) + "s", flush=True)
                     time.sleep(min(wait, 30))
                     continue
                 if r.status_code == 400 and "reasoning" in body:
                     body.pop("reasoning")
                     r = requests.post(OR_URL, headers=headers, json=body, timeout=300)
                 if r.status_code in (402, 404, 400):
-                    raise RuntimeError(f"{model} -> {r.status_code} {r.text[:160]}")
+                    raise RuntimeError(model + " -> " + str(r.status_code) + " " + r.text[:160])
                 r.raise_for_status()
                 data = r.json()
-                choice = (data.get("choices") or [{}])[0]
-                msg = choice.get("message") or {}
+                choices = data.get("choices") or [{}]
+                msg = choices[0].get("message") or {}
                 content = msg.get("content")
                 if not content or not str(content).strip():
-                    raise RuntimeError(
-                        f"empty/null content (finish_reason={choice.get('finish_reason')})")
+                    raise RuntimeError("empty/null content (finish_reason="
+                                       + str(choices[0].get("finish_reason")) + ")")
                 return content
             except Exception as e:
                 last = e
-                print(f"⚠️ {model} attempt {attempt+1} failed ({str(e)[:140]})", flush=True)
+                print("attempt failed: " + str(e)[:140], flush=True)
                 time.sleep(2)
-        print(f"⚠️ failing over from {model}", flush=True)
-    raise RuntimeError(f"All OpenRouter models failed: {last}")
+        print("failing over from " + model, flush=True)
+    raise RuntimeError("All OpenRouter models failed: " + str(last))
 
 
-def ass_time(t: float) -> str:
+def ass_time(t):
     t = max(0.0, t)
-    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-    return f"{h}:{m:02d}:{s:05.2f}"
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    return str(h) + ":" + str(m).zfill(2) + ":" + ("%05.2f" % s)
 
 
-def emoji_png(emoji: str, path: str) -> bool:
+def emoji_png(emoji, path):
     """Twemoji PNG (CC-BY 4.0). Tries with/without FE0F."""
-    cps = "-".join(f"{ord(c):x}" for c in emoji if ord(c) != 0xFE0F)
-    cps_f = "-".join(f"{ord(c):x}" for c in emoji)
+    cps = "-".join(format(ord(c), "x") for c in emoji if ord(c) != 0xFE0F)
+    cps_f = "-".join(format(ord(c), "x") for c in emoji)
     for cp in (cps_f, cps):
-        url = f"https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{cp}.png"
+        url = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/" + cp + ".png"
         try:
             r = requests.get(url, timeout=30)
             if r.status_code == 200 and r.content[:4] == b"\x89PNG":
