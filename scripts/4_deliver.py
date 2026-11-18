@@ -1,4 +1,5 @@
-"""Step 4: Telegram delivery with 50MB guard + real error checking."""
+"""Step 4: Telegram delivery. 49MB guard -> compact re-encode -> sendVideo ->
+sendDocument fallback. Real response checking. Never uploads corpses."""
 import os
 import glob
 import subprocess
@@ -10,10 +11,11 @@ LIMIT = 49 * 1024 * 1024
 
 
 def send(method, path, caption):
+    field = "video" if method == "sendVideo" else "document"
     with open(path, "rb") as f:
         r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}",
                           data={"chat_id": CHAT, "caption": caption},
-                          files={method.replace("send", "").lower(): f}, timeout=600)
+                          files={field: f}, timeout=600)
     ok = r.status_code == 200 and r.json().get("ok")
     if not ok:
         print(f"❌ {method} failed: {r.text[:200]}", flush=True)
@@ -22,8 +24,14 @@ def send(method, path, caption):
 
 def main():
     failures = 0
-    for reel in sorted(glob.glob("final_reels/*.mp4")):
+    reels = sorted(glob.glob("final_reels/*.mp4"))
+    if not reels:
+        raise SystemExit("no reels found in final_reels/")
+    for reel in reels:
         name = os.path.basename(reel)
+        if os.path.getsize(reel) < 1 * 1024 * 1024:
+            print(f"⚠️ skipping suspicious tiny file {name}", flush=True)
+            continue
         path = reel
         if os.path.getsize(reel) > LIMIT:
             compact = f"work/compact_{name}"
