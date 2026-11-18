@@ -1,4 +1,4 @@
-"""Shared helpers: subprocess, json, OpenRouter chat, ASS time, emoji assets."""
+"""Shared helpers. Never returns null content; never hangs silently."""
 import os
 import re
 import json
@@ -49,11 +49,11 @@ def extract_json(text):
         raise
 
 
-def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
+def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
                     json_mode=True, schema_hint=None):
-    """Failover chat across OpenRouter models. Never returns null/empty content.
-    Attempts 0-1 normal; attempts 2-3 disable hidden reasoning (fixes null-content
-    responses from thinking models that spend the whole budget on reasoning)."""
+    """Failover chat. Hidden reasoning DISABLED for json calls (prevents
+    finish_reason=length null-content burns). Retries 429, strips unsupported
+    reasoning param on 400, rejects empty content, fails over across models."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
@@ -70,10 +70,9 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
                     "temperature": temperature, "max_tokens": max_tokens}
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
-                        if json_mode:
                 body["reasoning"] = {"enabled": False}
             try:
-                r = requests.post(OR_URL, headers=headers, json=body, timeout=600)
+                r = requests.post(OR_URL, headers=headers, json=body, timeout=300)
                 if r.status_code == 429:
                     wait = float(r.headers.get("Retry-After", 5))
                     print(f"⏳ {model} 429, waiting {wait}s", flush=True)
@@ -81,7 +80,7 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
                     continue
                 if r.status_code == 400 and "reasoning" in body:
                     body.pop("reasoning")
-                    r = requests.post(OR_URL, headers=headers, json=body, timeout=600)
+                    r = requests.post(OR_URL, headers=headers, json=body, timeout=300)
                 if r.status_code in (402, 404, 400):
                     raise RuntimeError(f"{model} -> {r.status_code} {r.text[:160]}")
                 r.raise_for_status()
@@ -96,7 +95,7 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=12000,
             except Exception as e:
                 last = e
                 print(f"⚠️ {model} attempt {attempt+1} failed ({str(e)[:140]})", flush=True)
-                time.sleep(3)
+                time.sleep(2)
         print(f"⚠️ failing over from {model}", flush=True)
     raise RuntimeError(f"All OpenRouter models failed: {last}")
 
@@ -108,7 +107,7 @@ def ass_time(t: float) -> str:
 
 
 def emoji_png(emoji: str, path: str) -> bool:
-    """Download a Twemoji PNG (CC-BY 4.0). Tries with/without FE0F."""
+    """Twemoji PNG (CC-BY 4.0). Tries with/without FE0F."""
     cps = "-".join(f"{ord(c):x}" for c in emoji if ord(c) != 0xFE0F)
     cps_f = "-".join(f"{ord(c):x}" for c in emoji)
     for cp in (cps_f, cps):
