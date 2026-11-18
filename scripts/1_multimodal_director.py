@@ -1,19 +1,19 @@
-"""Step 1: download, whisper, audio-energy map, silence gaps, scene keyframes,
-then Gemini (free-tier only) as EYES+EARS. Fallback: dense frames -> Gemini
-inline -> OpenRouter free VL (Ling / Nemotron). Never 6 blind keyframes again."""
+"""Step 1: download, whisper, energy map, gaps, scene keyframes,
+Gemini (free-tier only) eyes+ears. Fallbacks: dense inline frames ->
+OpenRouter free VL -> transcript-only notes. Bounded waits everywhere."""
 import os
 import time
 import json
 import wave
 import subprocess
 import numpy as np
-import requests
-from typing import Literal, Optional
+from typing import Literal
 from pydantic import BaseModel, Field
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from google import genai
 from google.genai import types
-from common import run, ffprobe_duration, save_json, extract_json, openrouter_chat, WORK
+from common import (run, ffprobe_duration, save_json, extract_json,
+                    openrouter_chat, WORK)
 
 VIDEO_URL = os.environ["VIDEO_URL"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -25,14 +25,13 @@ FREE_MODEL_ORDER = [
 ]
 EXCLUDED = ("tts", "live", "image", "nano-banana", "omni", "transcribe",
             "translate", "embedding", "robotics", "deep-research", "pro", "argon", "carbon")
-
 VL_FALLBACK = ["inclusionai/ling-3.2-flash:free", "nvidia/nemotron-3.5-super-vl:free"]
 
 
 class SpeakerBox(BaseModel):
-    label: str = Field(description="Speaker name if readable on screen, else 'left'/'right'/'center'")
-    x: float = Field(description="Normalized 0-1 horizontal center of the speaker")
-    y: float = Field(description="Normalized 0-1 vertical center")
+    label: str = Field(description="On-screen name if readable, else left/right/center")
+    x: float
+    y: float
 
 
 class FrameNote(BaseModel):
@@ -45,7 +44,7 @@ class FrameNote(BaseModel):
 
 class HypeMoment(BaseModel):
     t: float
-    kind: str = Field(description="laughter / punchline / kill / beat_drop / shout / reveal")
+    kind: str
     note: str = ""
 
 
@@ -76,7 +75,7 @@ def get_model_pool(client):
         print(f"Free-tier Gemini pool: {pool}", flush=True)
         return pool or FREE_MODEL_ORDER
     except Exception as e:
-        print(f"⚠️ model list failed ({e}); using built-in free pool", flush=True)
+        print(f"⚠️ model list failed ({e}); built-in free pool", flush=True)
         return FREE_MODEL_ORDER
 
 
@@ -85,11 +84,14 @@ def gemini_failover(client, pool, contents, prompt):
     for name in pool:
         try:
             print(f"Trying {name}...", flush=True)
-            return client.models.generate_content(
+            resp = client.models.generate_content(
                 model=name, contents=[*contents, prompt],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=VisualNotes, temperature=0.2))
+            if not resp.text:
+                raise RuntimeError("empty Gemini response (safety block?)")
+            return resp.text
         except Exception as e:
             last = e
             if "INVALID_ARGUMENT" in str(e) and "token" in str(e).lower():
@@ -105,16 +107,12 @@ def audio_energy(wav_path):
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
     hop = int(sr * 0.25)
     n = len(pcm) // hop
-    curve = []
-    for i in range(n):
-        seg = pcm[i * hop:(i + 1) * hop]
-        rms = float(np.sqrt(np.mean(seg ** 2)) + 1e-6)
-        curve.append(round(20 * np.log10(rms), 2))
-    curve = np.array(curve)
+    curve = np.array([round(20 * np.log10(float(np.sqrt(np.mean(
+        pcm[i*hop:(i+1)*hop] ** 2)) + 1e-6), 2) for i in range(n)])
     med = float(np.median(curve))
     peaks = []
     for i in range(1, n - 1):
-        if curve[i] > med + 6 and curve[i] >= curve[i - 1] and curve[i] > curve[i + 1]:
+        if curve[i] > med + 6 and curve[i] >= curve[i-1] and curve[i] > curve[i+1]:
             t = round(i * 0.25, 2)
             if not peaks or t - peaks[-1] > 0.6:
                 peaks.append(t)
@@ -140,11 +138,10 @@ def scene_keyframes(master, duration):
         scenes = detect(master, ContentDetector(threshold=27.0))
         changes = [round(s[0].get_seconds(), 2) for s in scenes[1:]]
     except Exception as e:
-        print(f"⚠️ scene detect failed ({e}); uniform sampling only", flush=True)
+        print(f"⚠️ scene detect failed ({e}); uniform only", flush=True)
     step = max(10.0, duration / 60.0)
     uniform = [round(t, 2) for t in np.arange(step / 2, duration, step)]
-    kf = sorted(set(changes + uniform))[:150]
-    return {"changes": changes, "keyframes": kf}
+    return {"changes": changes, "keyframes": sorted(set(changes + uniform))[:150]}
 
 
 def extract_frames(master, timestamps, tag):
@@ -160,11 +157,10 @@ def extract_frames(master, timestamps, tag):
 
 
 def vl_fallback_notes(frames, prompt):
-    """Dense frame batches through free OpenRouter vision models."""
     import base64
     timeline, hype, genre, summary = [], [], "unknown", ""
-    for chunk_start in range(0, len(frames), 60):
-        chunk = frames[chunk_start:chunk_start + 60]
+    for cs in range(0, len(frames), 60):
+        chunk = frames[cs:cs + 60]
         content = [{"type": "text", "text": prompt + "\nFrame timestamps (seconds): "
                     + json.dumps([t for t, _ in chunk])}]
         for ts, p in chunk:
@@ -172,9 +168,9 @@ def vl_fallback_notes(frames, prompt):
                 b64 = base64.b64encode(f.read()).decode()
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-        txt = openrouter_chat(VL_FALLBACK, [{"role": "user", "content": content}],
-                              schema_hint=VisualNotes.model_json_schema())
-        d = extract_json(txt)
+        d = extract_json(openrouter_chat(
+            VL_FALLBACK, [{"role": "user", "content": content}],
+            schema_hint=VisualNotes.model_json_schema()))
         timeline += d.get("timeline", [])
         hype += d.get("hype_moments", [])
         genre = d.get("overall_genre", genre)
@@ -219,11 +215,13 @@ def main():
         lines.append(f"[{s.start:.2f}s - {s.end:.2f}s] {s.text.strip()}")
         for w in (s.words or []):
             words.append({"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)})
+    if not words:
+        raise RuntimeError("Whisper produced no words - audio track missing?")
     save_json("words.json", words)
     with open(f"{WORK}/transcript.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print("4. Audio energy + silence gaps + scene keyframes...", flush=True)
+    print("4. Energy + gaps + scene keyframes...", flush=True)
     save_json("energy.json", audio_energy(wav))
     save_json("gaps.json", silence_gaps(words, duration))
     scenes = scene_keyframes(master, duration)
@@ -246,26 +244,26 @@ Transcript for speaker-name grounding:
     try:
         print("5. Uploading proxy to Gemini File API...", flush=True)
         uploaded = client.files.upload(file=proxy)
-        while uploaded.state.name == "PROCESSING":
-            time.sleep(3)
+        waited = 0
+        while uploaded.state.name == "PROCESSING" and waited < 180:
+            time.sleep(3); waited += 3
             uploaded = client.files.get(name=uploaded.name)
         if uploaded.state.name != "ACTIVE":
-            raise RuntimeError(f"file state {uploaded.state.name}")
-        notes = json.loads(gemini_failover(client, pool, [uploaded], prompt).text)
+            raise RuntimeError(f"file state {uploaded.state.name} after {waited}s")
+        notes = extract_json(gemini_failover(client, pool, [uploaded], prompt))
     except Exception as e:
         print(f"⚠️ video path failed ({e}); dense keyframes -> Gemini inline", flush=True)
         frames = extract_frames(master, scenes["keyframes"][:40], "kf")
         try:
             parts = [types.Part.from_bytes(data=open(p, "rb").read(), mime_type="image/jpeg")
                      for _, p in frames]
-            notes = json.loads(gemini_failover(client, pool, parts, prompt).text)
+            notes = extract_json(gemini_failover(client, pool, parts, prompt))
         except Exception as e2:
             print(f"⚠️ Gemini inline failed ({e2}); OpenRouter free VL fallback", flush=True)
             try:
-                frames = extract_frames(master, scenes["keyframes"], "kf")
-                notes = vl_fallback_notes(frames, prompt)
+                notes = vl_fallback_notes(extract_frames(master, scenes["keyframes"], "kf"), prompt)
             except Exception as e3:
-                print(f"⚠️ ALL vision paths failed ({e3}); showrunner will work transcript-only", flush=True)
+                print(f"⚠️ ALL vision paths failed ({e3}); transcript-only mode", flush=True)
                 notes = {"overall_genre": "unknown", "summary": "", "timeline": [], "hype_moments": []}
     finally:
         if uploaded:
