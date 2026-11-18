@@ -2,7 +2,7 @@
 blur; eased zoom+shake in ALL modes; silence tightening w/ remap; kinetic hook,
 captions v2, progress bar, lower-third, emoji stickers; procedural SFX ducked
 under voice; single encode pass; hard duration/size guards; ffmpeg stderr logged;
-partial files deleted; intermediates cleaned."""
+partial files deleted; intermediates cleaned; reel-count assert at the end."""
 import os
 import math
 import time
@@ -460,6 +460,4 @@ def main():
             render(cut, final, ass, sfx, mode, peaks_rel, dur, detector, priors, emojis)
         except Exception:
             if os.path.exists(final):
-                os.remove(final)
-            raise
-      
+                os.remove(f
