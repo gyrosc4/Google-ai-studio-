@@ -1,4 +1,5 @@
-"""Shared helpers. Never returns null content; never hangs silently."""
+"""Shared helpers. Probes models for thinking-lock before real calls;
+never returns null content; never burns minutes on locked models."""
 import os
 import re
 import json
@@ -8,6 +9,9 @@ import requests
 
 WORK = "work"
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_PROBE_GOOD = set()
+_PROBE_BAD = set()
 
 
 def run(cmd, **kw):
@@ -50,11 +54,44 @@ def extract_json(text):
         raise
 
 
+def _probe(model, headers):
+    """Tiny 1s call: can this model emit content with thinking disabled?
+    Thinking-locked models (null content at finish_reason=length) are skipped."""
+    if model in _PROBE_GOOD:
+        return True
+    if model in _PROBE_BAD:
+        return False
+    body = {"model": model,
+            "messages": [{"role": "user", "content": "Reply with the single word OK"}],
+            "max_tokens": 48, "temperature": 0,
+            "reasoning": {"enabled": False}}
+    try:
+        r = requests.post(OR_URL, headers=headers, json=body, timeout=60)
+        if r.status_code != 200:
+            _PROBE_BAD.add(model)
+            print("probe skip " + model + " (http " + str(r.status_code) + ")", flush=True)
+            return False
+        choices = r.json().get("choices") or [{}]
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if content and str(content).strip():
+            _PROBE_GOOD.add(model)
+            print("probe ok " + model, flush=True)
+            return True
+        _PROBE_BAD.add(model)
+        print("probe skip " + model + " (thinking-locked, null content)", flush=True)
+        return False
+    except Exception as e:
+        _PROBE_BAD.add(model)
+        print("probe skip " + model + " (" + str(e)[:100] + ")", flush=True)
+        return False
+
+
 def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
                     json_mode=True, schema_hint=None):
-    """Failover chat across OpenRouter models. Hidden reasoning is disabled for
-    JSON calls (prevents null-content token burns). Retries 429, strips an
-    unsupported reasoning param on 400, rejects empty content, fails over."""
+    """Failover chat across OpenRouter models. Probes first, disables hidden
+    reasoning for JSON calls, retries 429, strips unsupported reasoning on 400,
+    rejects empty content, jumps models immediately on thinking-lock."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
@@ -66,6 +103,8 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     last = None
     for model in model_pool:
+        if not _probe(model, headers):
+            continue
         for attempt in range(4):
             body = {"model": model, "messages": messages,
                     "temperature": temperature, "max_tokens": max_tokens}
@@ -96,6 +135,9 @@ def openrouter_chat(model_pool, messages, temperature=0.3, max_tokens=8000,
             except Exception as e:
                 last = e
                 print("attempt failed: " + str(e)[:140], flush=True)
+                if "finish_reason=length" in str(e):
+                    _PROBE_BAD.add(model)
+                    break
                 time.sleep(2)
         print("failing over from " + model, flush=True)
     raise RuntimeError("All OpenRouter models failed: " + str(last))
