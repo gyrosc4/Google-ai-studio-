@@ -1,13 +1,13 @@
-"""Step 2: ERNIE 5.5 Flash (free, OpenRouter) as showrunner.
-Transcript + visual notes + audio energy -> grounded blueprint -> critic pass."""
+"""Step 2: ERNIE 5.5 Flash (free, OpenRouter) showrunner + one critic re-pick max.
+Grounding snaps cuts to sentence/silence boundaries, validates peaks against
+audio energy, dedupes overlaps, sorts by virality. Never dies on a bad response."""
 import os
 import json
-from typing import Literal, Optional
+from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
-from common import (load_json, save_json, extract_json, openrouter_chat,
-                    ffprobe_duration, WORK)
+from common import load_json, save_json, extract_json, openrouter_chat, WORK
 
-NUM_REELS = int(os.environ.get("NUM_REELS", "3"))
+NUM_REELS = max(1, min(5, int(os.environ.get("NUM_REELS", "3"))))
 BRAIN_POOL = ["baidu/ernie-5.5-flash-preview:free",
               "inclusionai/ling-3.2-flash:free",
               "nvidia/nemotron-3-ultra-550b-a55b:free"]
@@ -24,17 +24,17 @@ class SfxCues(BaseModel):
 
 
 class ClipDirective(BaseModel):
-    title: str = Field(description="3-5 word viral hook banner")
+    title: str
     start_time: float
     end_time: float
     content_mode: Literal["podcast_dual", "podcast_single", "gaming_action", "explainer"]
     caption_theme: Literal["hype_gaming", "editorial_podcast", "bold_explainer"]
     virality_score: int
     peak_moments: list[float] = []
-    emphasis_words: list[str] = Field(default=[], description="Words to accent in captions, uppercase")
+    emphasis_words: list[str] = []
     hook_style: Literal["pop", "slide", "shake"] = "pop"
-    lower_third: str = Field(default="", description="Speaker name for animated lower-third, or empty")
-    emojis: list[EmojiCue] = Field(default=[], description="Max 2 emoji stickers with absolute timestamps")
+    lower_third: str = ""
+    emojis: list[EmojiCue] = []
     sfx: SfxCues = SfxCues()
     reason: str = ""
 
@@ -66,7 +66,7 @@ def snap(t, candidates, window):
     return best
 
 
-def ground(bp: Blueprint, duration, words, gaps, energy_peaks):
+def ground(bp, duration, words, gaps, energy_peaks):
     starts = [w["start"] for w in words] + [g[1] for g in gaps]
     ends = [w["end"] for w in words] + [g[0] for g in gaps]
     out = []
@@ -93,13 +93,12 @@ def ground(bp: Blueprint, duration, words, gaps, energy_peaks):
     out.sort(key=lambda c: -c.virality_score)
     kept = []
     for c in out:
-        overlap = False
-        for k in kept:
-            lo = max(c.start_time, k.start_time); hi = min(c.end_time, k.end_time)
-            if hi - lo > 0.3 * min(c.end_time - c.start_time, k.end_time - k.start_time):
-                overlap = True
-        if not overlap:
-            kept.append(c)
+        if any(max(c.start_time, k.start_time) < min(c.end_time, k.end_time) and
+               (min(c.end_time, k.end_time) - max(c.start_time, k.start_time)) >
+               0.3 * min(c.end_time - c.start_time, k.end_time - k.start_time)
+               for k in kept):
+            continue
+        kept.append(c)
         if len(kept) >= NUM_REELS:
             break
     bp.clips = kept
@@ -149,16 +148,14 @@ TRANSCRIPT:
 {transcript}"""
 
     schema = Blueprint.model_json_schema()
-    bp = None
-    last_good = None
-    feedback = ""
+    bp, last_good, feedback = None, None, ""
     for iteration in range(2):
         prompt = director_prompt + (
             f"\nPREVIOUS PICKS REJECTED BY CRITIC, fix these issues and pick better/alternative segments:\n{feedback}"
             if feedback else "")
         try:
             txt = openrouter_chat(BRAIN_POOL, [{"role": "user", "content": prompt}],
-                                  temperature=0.35, schema_hint=schema)
+                                  temperature=0.35, max_tokens=8000, schema_hint=schema)
             bp = Blueprint.model_validate(extract_json(txt))
         except Exception as e:
             print(f"⚠️ director attempt failed ({str(e)[:200]})", flush=True)
@@ -176,7 +173,6 @@ TRANSCRIPT:
             continue
         last_good = bp
 
-        # ---- CRITIC PASS ----
         critic_payload = "\n\n".join(
             f"CLIP {i} [{c.start_time:.1f}-{c.end_time:.1f}] hook='{c.title}'\n{clip_transcript(words, c.start_time, c.end_time)}"
             for i, c in enumerate(bp.clips))
@@ -186,18 +182,18 @@ TRANSCRIPT:
                 f"first 3 seconds, is the payoff complete inside the clip, does it stand alone without "
                 f"context? Return items with index, keep (bool), hook_strength 1-10, payoff_complete, "
                 f"standalone, issue.\n\n{critic_payload}"}],
-                temperature=0.1, schema_hint=CriticReport.model_json_schema())
+                temperature=0.1, max_tokens=4000, schema_hint=CriticReport.model_json_schema())
             report = CriticReport.model_validate(extract_json(ctxt))
         except Exception as e:
             print(f"⚠️ critic failed ({str(e)[:160]}); accepting grounded blueprint", flush=True)
             break
-                bad = [it for it in report.items
+        bad = [it for it in report.items
                if (not it.keep) or (not it.payoff_complete) or (not it.standalone)]
         if not bad or iteration == 1:
             print("✅ critic approved (or final iteration); locking blueprint", flush=True)
             break
         feedback = "\n".join(f"clip {it.index}: {it.issue or 'weak hook/incomplete payoff'}" for it in bad)
-        print(f"🔁 critic rejected {len(bad)} clips, re-picking (iter {iteration+1})", flush=True)
+        print(f"🔁 critic rejected {len(bad)} clips, re-picking once", flush=True)
         bp = None
 
     if bp is None or not bp.clips:
