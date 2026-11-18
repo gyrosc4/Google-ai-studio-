@@ -1,9 +1,12 @@
-"""Step 3: editor v2. Fixed BlazeFace (init once), eased zoom punches in ALL modes,
-silence tightening with timeline remap, kinetic hook + captions v2 + progress bar +
-lower-third, emoji stickers, procedural SFX with voice ducking, single encode pass."""
+"""Step 3: editor v3. BlazeFace init once; 30fps cap; cheap resamplers; low-res
+blur; eased zoom+shake in ALL modes; silence tightening w/ remap; kinetic hook,
+captions v2, progress bar, lower-third, emoji stickers; procedural SFX ducked
+under voice; single encode pass; hard duration/size guards; ffmpeg stderr logged;
+partial files deleted; intermediates cleaned."""
 import os
 import math
-import json
+import time
+import glob
 import wave
 import subprocess
 import numpy as np
@@ -16,6 +19,7 @@ TIGHTEN = os.environ.get("TIGHTEN_SILENCE", "1") == "1"
 MODEL_PATH = f"{WORK}/blaze_face_short_range.tflite"
 HAAR_PATH = f"{WORK}/haarcascade_frontalface_default.xml"
 OUT_W, OUT_H = 1080, 1920
+MAX_REEL_BYTES = 300 * 1024 * 1024
 
 THEMES = {
     "hype_gaming": ("&H0000FFFF", "&H00FFFFFF", "&H00000000"),
@@ -84,7 +88,6 @@ def faces(kind, det, frame):
 
 
 def keep_segments(gaps, s, e):
-    """Clip-relative keep segments, compressing gaps > 1.2s to 0.3s."""
     segs, cur = [], 0.0
     for gs, ge in gaps:
         gs, ge = gs - s, ge - s
@@ -118,11 +121,11 @@ def tighten_cut(raw, cut, segs):
         run(["ffmpeg", "-nostdin", "-y", "-i", raw,
              "-vf", f"select='{expr}',setpts=N/FRAME_RATE/TB",
              "-af", f"aselect='{expr}',asetpts=N/SR/TB",
-             "-c:v", "libx264", "-crf", "17", "-preset", "veryfast",
+             "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast",
              "-c:a", "aac", "-b:a", "192k", cut])
         return True
     except Exception as e:
-        print(f"⚠️ tighten failed ({e}); using untrimmed cut", flush=True)
+        print(f"⚠️ tighten failed ({e}); untrimmed cut", flush=True)
         run(["ffmpeg", "-nostdin", "-y", "-i", raw, "-c", "copy", cut])
         return False
 
@@ -177,12 +180,11 @@ Style: Progress,Montserrat ExtraBold,10,{primary},{primary},{primary},&H00000000
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
-    # animated hook: per-word pop-in
     title_words = clip["title"].upper().split()
     widths = [len(w) * 46 + 24 for w in title_words]
     x = (OUT_W - sum(widths)) // 2
     for i, w in enumerate(title_words):
-        st = 0.10 * i
+        st = min(0.10 * i, max(0.0, dur - 0.5))
         cx = x + widths[i] // 2
         x += widths[i]
         anim = {"pop": r"{\fscx30\fscy30\alpha&HFF&\t(0,170,\fscx100\fscy100\alpha&H00&)}",
@@ -190,25 +192,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "shake": r"{\fscx120\fscy120\alpha&HFF&\t(0,120,\fscx100\fscy100\alpha&H00&)\t(120,200,\frz2)\t(200,280,\frz0)}"}
         tag = anim.get(clip.get("hook_style", "pop"), anim["pop"])
         events.append(f"Dialogue: 2,{ass_time(st)},{ass_time(dur)},HookWord,,0,0,0,,{{\\an8\\pos({cx},300)}}{tag}{w}")
-    # progress bar
     events.append(f"Dialogue: 0,0:00:00.00,{ass_time(dur)},Progress,,0,0,0,,"
                   f"{{\\p1\\clip(0,1906,0,1920)\\t(0,{int(dur*1000)},\\clip(0,1906,1080,1920))}}"
                   f"m 0 0 l 1080 0 1080 14 0 14{{\\p0}}")
-    # lower third
     if clip.get("lower_third"):
         events.append(f"Dialogue: 1,0:00:00.30,{ass_time(min(dur,5.0))},LowerThird,,0,0,0,,"
                       f"{{\\move(-500,700,60,700,0,350)\\fad(0,250)}}{clip['lower_third'].upper()}")
-    # kinetic captions
     cw = [{"word": w["word"].upper(), "start": remap(max(s, w["start"]) - s),
            "end": remap(min(e, w["end"]) - s)}
           for w in words if w["end"] > s and w["start"] < e and w["word"].strip()]
     for i in range(0, len(cw), 3):
         chunk = cw[i:i + 3]
         for ai, aw in enumerate(chunk):
-            st = aw["start"]
+            st = min(aw["start"], max(0.0, dur - 0.1))
             en = chunk[ai + 1]["start"] if ai + 1 < len(chunk) else aw["end"]
+            en = min(en, dur)
             if en <= st:
-                en = st + 0.12
+                en = min(dur, st + 0.12)
             toks = []
             for j, t in enumerate(chunk):
                 txt = t["word"].replace("{", "").replace("}", "")
@@ -226,7 +226,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def render(cut, final, ass, sfx, mode, peaks_rel, dur, detector, priors, emojis):
     cap = cv2.VideoCapture(cut)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = 2 if src_fps > 32 else 1
+    fps = src_fps / step
     sw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); sh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     kind, det = detector
     cmd = ["ffmpeg", "-nostdin", "-y",
@@ -245,84 +247,110 @@ def render(cut, final, ass, sfx, mode, peaks_rel, dur, detector, priors, emojis)
     fc.append("[sfxraw][1:a]sidechaincompress=threshold=0.06:ratio=10:attack=15:release=250[sfxd]")
     fc.append("[1:a][sfxd]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
     cmd += ["-filter_complex", ";".join(fc), "-map", f"[{vlabel}]", "-map", "[aout]",
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", "-c:a", "aac", "-b:a", "192k", final]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", "-c:a", "aac", "-b:a", "192k",
+            "-t", f"{dur:.3f}", "-fs", "300M", final]
+    logp = f"{WORK}/ffmpeg_{os.path.basename(final)}.log"
+    logf = open(logp, "wb")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=logf)
 
     smooth_cx = priors.get("single", 0.5)
     left_cx, right_cx = priors.get("left", 0.28), priors.get("right", 0.72)
-    fi = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        t = fi / fps
-        zoom, shake = 1.0, 0.0
-        for pk in peaks_rel:
-            dt = t - pk
-            if 0 <= dt <= 0.5:
-                env = math.sin((dt / 0.5) * math.pi)
-                zoom = 1.0 + 0.14 * env
-                shake = env
+    t0 = time.time()
+    idx = out_i = 0
+    try:
+        while cap.grab():
+            if idx % step:
+                idx += 1
+                continue
+            ret, frame = cap.retrieve()
+            idx += 1
+            if not ret:
                 break
-        if fi % 5 == 0 and mode in ("podcast_single", "podcast_dual"):
-            cs = faces(kind, det, frame)
-            if cs:
-                if mode == "podcast_single":
-                    smooth_cx = 0.85 * smooth_cx + 0.15 * cs[0][0]
-                else:
-                    lf = [c[0] for c in cs if c[0] < 0.5]
-                    rf = [c[0] for c in cs if c[0] >= 0.5]
-                    if lf: left_cx = 0.85 * left_cx + 0.15 * lf[0]
-                    if rf: right_cx = 0.85 * right_cx + 0.15 * rf[0]
-        dx = int(3 * math.sin(t * 47) * shake); dy = int(2 * math.cos(t * 53) * shake)
+            t = out_i / fps
+            zoom, shake = 1.0, 0.0
+            for pk in peaks_rel:
+                dt = t - pk
+                if 0 <= dt <= 0.5:
+                    env = math.sin((dt / 0.5) * math.pi)
+                    zoom = 1.0 + 0.14 * env
+                    shake = env
+                    break
+            if out_i % 10 == 0 and mode in ("podcast_single", "podcast_dual"):
+                cs = faces(kind, det, frame)
+                if cs:
+                    if mode == "podcast_single":
+                        smooth_cx = 0.85 * smooth_cx + 0.15 * cs[0][0]
+                    else:
+                        lf = [c[0] for c in cs if c[0] < 0.5]
+                        rf = [c[0] for c in cs if c[0] >= 0.5]
+                        if lf: left_cx = 0.85 * left_cx + 0.15 * lf[0]
+                        if rf: right_cx = 0.85 * right_cx + 0.15 * rf[0]
+            dx = int(3 * math.sin(t * 47) * shake); dy = int(2 * math.cos(t * 53) * shake)
 
-        if mode == "podcast_dual":
-            half = OUT_H // 2
-            cw = min(sw, max(64, int(sh * (OUT_W / half) / zoom)))
-            ch = min(sh, max(64, int(sh / zoom)))
-            y1 = max(0, (sh - ch) // 2)
-            xt = int(np.clip(left_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
-            xb = int(np.clip(right_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
-            xt = int(np.clip(xt, 0, max(0, sw - cw))); xb = int(np.clip(xb, 0, max(0, sw - cw)))
-            top = cv2.resize(frame[y1:y1+ch, xt:xt+cw], (OUT_W, half), interpolation=cv2.INTER_LANCZOS4)
-            bot = cv2.resize(frame[y1:y1+ch, xb:xb+cw], (OUT_W, half), interpolation=cv2.INTER_LANCZOS4)
-            canvas = np.vstack([top, bot])
-        elif mode == "gaming_action":
-            bg = cv2.GaussianBlur(cv2.resize(frame, (OUT_W, OUT_H)), (51, 51), 0)
-            fg_h = int(OUT_W * (sh / sw))
-            zfg = cv2.resize(frame, (int(OUT_W * zoom), int(fg_h * zoom)), interpolation=cv2.INTER_LANCZOS4)
-            zh, zw = zfg.shape[:2]
-            x0 = max(0, (zw - OUT_W) // 2 + dx); y0 = max(0, (zh - fg_h) // 2 + dy)
-            fg = zfg[y0:y0+fg_h, x0:x0+OUT_W]
-            if fg.shape[0] != fg_h or fg.shape[1] != OUT_W:
-                fg = cv2.resize(fg, (OUT_W, fg_h))
-            yo = (OUT_H - fg_h) // 2
-            canvas = bg
-            canvas[yo:yo+fg_h, 0:OUT_W] = fg
-        else:
-            ch = min(sh, max(64, int(sh / zoom)))
-            cw = min(sw, max(64, int(ch * (OUT_W / OUT_H))))
-            x1 = int(np.clip(smooth_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
-            y1 = max(0, (sh - ch) // 2) + dy
-            x1 = int(np.clip(x1, 0, max(0, sw - cw))); y1 = int(np.clip(y1, 0, max(0, sh - ch)))
-            canvas = cv2.resize(frame[y1:y1+ch, x1:x1+cw], (OUT_W, OUT_H), interpolation=cv2.INTER_LANCZOS4)
-        proc.stdin.write(canvas.tobytes())
-        fi += 1
-    cap.release()
-    proc.stdin.close()
-    if proc.wait() != 0:
-        raise RuntimeError("ffmpeg render pass failed")
+            if mode == "podcast_dual":
+                half = OUT_H // 2
+                cw = min(sw, max(64, int(sh * (OUT_W / half) / zoom)))
+                ch = min(sh, max(64, int(sh / zoom)))
+                y1 = max(0, (sh - ch) // 2)
+                xt = int(np.clip(left_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
+                xb = int(np.clip(right_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
+                xt = int(np.clip(xt, 0, max(0, sw - cw))); xb = int(np.clip(xb, 0, max(0, sw - cw)))
+                top = cv2.resize(frame[y1:y1+ch, xt:xt+cw], (OUT_W, half), interpolation=cv2.INTER_CUBIC)
+                bot = cv2.resize(frame[y1:y1+ch, xb:xb+cw], (OUT_W, half), interpolation=cv2.INTER_CUBIC)
+                canvas = np.vstack([top, bot])
+            elif mode == "gaming_action":
+                small = cv2.GaussianBlur(cv2.resize(frame, (270, 480), interpolation=cv2.INTER_AREA), (15, 15), 0)
+                bg = cv2.resize(small, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+                fg_h = int(OUT_W * (sh / sw))
+                zfg = cv2.resize(frame, (int(OUT_W * zoom), int(fg_h * zoom)), interpolation=cv2.INTER_LINEAR)
+                zh, zw = zfg.shape[:2]
+                x0 = max(0, (zw - OUT_W) // 2 + dx); y0 = max(0, (zh - fg_h) // 2 + dy)
+                fg = zfg[y0:y0+fg_h, x0:x0+OUT_W]
+                if fg.shape[0] != fg_h or fg.shape[1] != OUT_W:
+                    fg = cv2.resize(fg, (OUT_W, fg_h))
+                yo = (OUT_H - fg_h) // 2
+                canvas = bg
+                canvas[yo:yo+fg_h, 0:OUT_W] = fg
+            else:
+                ch = min(sh, max(64, int(sh / zoom)))
+                cw = min(sw, max(64, int(ch * (OUT_W / OUT_H))))
+                x1 = int(np.clip(smooth_cx * sw - cw / 2, 0, max(0, sw - cw))) + dx
+                y1 = max(0, (sh - ch) // 2) + dy
+                x1 = int(np.clip(x1, 0, max(0, sw - cw))); y1 = int(np.clip(y1, 0, max(0, sh - ch)))
+                canvas = cv2.resize(frame[y1:y1+ch, x1:x1+cw], (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
+            proc.stdin.write(canvas.tobytes())
+            out_i += 1
+            if out_i % 300 == 0:
+                el = time.time() - t0
+                print(f"  render: {out_i} frames | {out_i/el:.1f} fps effective | {el:.0f}s elapsed", flush=True)
+    except BrokenPipeError:
+        print("⚠️ ffmpeg closed pipe early (see log)", flush=True)
+    finally:
+        cap.release()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        rc = proc.wait()
+        logf.close()
+    if rc != 0:
+        tail = open(logp, "rb").read()[-2000:].decode(errors="replace")
+        raise RuntimeError(f"ffmpeg render failed rc={rc}\n{tail}")
+    if out_i == 0:
+        raise RuntimeError("render produced zero frames")
 
 
 def main():
     os.makedirs("final_reels", exist_ok=True)
     bp = load_json("blueprint.json")
+    if not bp.get("clips"):
+        raise RuntimeError("blueprint has no clips")
     words = load_json("words.json")
     gaps = load_json("gaps.json")
     notes = load_json("visual_notes.json")
     master = f"{WORK}/master.mp4"
-    detector = make_detector()  # init ONCE, reused for every reel
+    detector = make_detector()
 
     for idx, clip in enumerate(bp["clips"], 1):
         s, e = float(clip["start_time"]), float(clip["end_time"])
@@ -330,27 +358,26 @@ def main():
         print(f"=== Reel {idx} [{mode}] {clip['title']} ({s:.1f}-{e:.1f}) ===", flush=True)
         raw, cut = f"{WORK}/raw_{idx}.mp4", f"{WORK}/cut_{idx}.mp4"
         run(["ffmpeg", "-nostdin", "-y", "-ss", str(s), "-i", master, "-t", str(e - s),
-             "-c:v", "libx264", "-crf", "17", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k", raw])
+             "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k", raw])
         segs = keep_segments(gaps, s, e) if TIGHTEN else [(0.0, e - s)]
         removed = (e - s) - sum(b - a for a, b in segs)
         if TIGHTEN and removed > 0.4:
-            ok = tighten_cut(raw, cut, segs)
-            if not ok:
+            if not tighten_cut(raw, cut, segs):
                 segs = [(0.0, e - s)]
         else:
             run(["ffmpeg", "-nostdin", "-y", "-i", raw, "-c", "copy", cut])
             segs = [(0.0, e - s)]
         remap, dur = make_remap(segs)
+        if dur <= 0:
+            raise RuntimeError(f"reel {idx} zero duration after tightening")
         peaks_rel = [remap(p - s) for p in clip.get("peak_moments", []) if s <= p <= e]
 
-        # speaker priors from vision timeline nearest clip middle
         priors = {}
         tl = notes.get("timeline", [])
         if tl:
             near = min(tl, key=lambda n: abs(n["t"] - (s + e) / 2))
-            sp = near.get("speakers", [])
+            sp = sorted(near.get("speakers", []), key=lambda b: b["x"])
             if len(sp) >= 2:
-                sp = sorted(sp, key=lambda b: b["x"])
                 priors = {"left": sp[0]["x"], "right": sp[-1]["x"]}
             elif len(sp) == 1:
                 priors = {"single": sp[0]["x"]}
@@ -365,8 +392,24 @@ def main():
             if emoji_png(cue["emoji"], p):
                 emojis.append((remap(cue["t"] - s), p))
         final = f"final_reels/reel_{idx}_{mode}.mp4"
-        render(cut, final, ass, sfx, mode, peaks_rel, dur, detector, priors, emojis)
-        print(f"✅ {final} ({os.path.getsize(final)/1e6:.1f} MB)", flush=True)
+        try:
+            render(cut, final, ass, sfx, mode, peaks_rel, dur, detector, priors, emojis)
+        except Exception:
+            if os.path.exists(final):
+                os.remove(final)
+            raise
+        size = os.path.getsize(final)
+        if size > MAX_REEL_BYTES or size < 1 * 1024 * 1024:
+            os.remove(final)
+            raise RuntimeError(f"reel {idx} bad encode ({size/1e6:.1f} MB) - aborted")
+        print(f"✅ {final} ({size/1e6:.1f} MB)", flush=True)
+        for p in (raw, cut):
+            if os.path.exists(p):
+                os.remove(p)
+
+    for p in glob.glob(f"{WORK}/kf_*.jpg"):
+        os.remove(p)
+    print("All reels rendered.", flush=True)
 
 
 if __name__ == "__main__":
