@@ -60,6 +60,11 @@ jobs:
           pip install -r requirements.txt
           pip install --upgrade --pre "yt-dlp[default]"
 
+      - name: Preflight - syntax check all scripts
+        run: |
+          python -m py_compile scripts/common.py scripts/1_multimodal_director.py scripts/2_showrunner.py scripts/3_adaptive_editor.py scripts/4_deliver.py
+          echo "All scripts compile OK"
+
       - name: Step 1 - Prep + Gemini Eyes & Ears
         run: python scripts/1_multimodal_director.py
 
